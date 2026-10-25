@@ -500,6 +500,33 @@ def require_member(entries: dict[str, Entry], name: str, expected_hash: str,
     return entry
 
 
+def validate_ota_trust(entries: dict[str, Entry], ota: dict[str, object], target: str,
+                       expected_primary_hash: str, expected_repository: str,
+                       expected_legacy_hash: str | None) -> str:
+    require_member(entries, "etc/libreecho/ota-public-key.hex", expected_primary_hash, 0o644)
+    if ota.get("public_key_sha256") != expected_primary_hash:
+        fail("OTA public-key manifest identity mismatch")
+    release_repository = ota.get("release_repository", "upstream")
+    if release_repository != expected_repository:
+        fail("OTA release repository identity mismatch")
+    if (release_repository == "srsatt" and expected_primary_hash ==
+            "524c2b6343438b6ccffca8a8c7f0b9f36e6ec9a2ee37424364b6bfeef96d7f40"):
+        fail("fork primary OTA authority cannot be the stock key")
+    legacy_key_hash = ota.get("legacy_public_key_sha256")
+    legacy_manifest_hash = ota.get("legacy_manifest_sha256")
+    if legacy_key_hash != expected_legacy_hash:
+        fail("OTA legacy public-key identity mismatch")
+    if legacy_key_hash is not None or legacy_manifest_hash is not None:
+        if (target != "biscuit"
+                or legacy_key_hash != "524c2b6343438b6ccffca8a8c7f0b9f36e6ec9a2ee37424364b6bfeef96d7f40"
+                or legacy_manifest_hash != "92f3f68a26b9ed1920658e419e1a417aafa9d36d1c0ea8cd90ec8202a832ad0e"):
+            fail("OTA legacy trust identity mismatch")
+        require_member(entries, "etc/libreecho/legacy-ota-public-key.hex", legacy_key_hash, 0o644)
+    elif "etc/libreecho/legacy-ota-public-key.hex" in entries:
+        fail("unrecorded OTA legacy public key")
+    return str(release_repository)
+
+
 def resolve_relative_symlink(name: str, target: str) -> str:
     components = target.split("/")
     if (
@@ -1303,6 +1330,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_bootctl_sha256: str,
                        expected_update_verifier_sha256: str,
                        expected_ota_public_key_sha256: str,
+                       expected_release_repository: str,
+                       expected_legacy_ota_public_key_sha256: str | None,
                        expected_adbd_sha256: str,
                        expected_audio_probe_sha256: str | None,
                        expected_tinyplay_sha256: str | None,
@@ -1397,12 +1426,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         record = ota.get("tools", {}).get(name, {})
         if record.get("sha256") != expected_hash or record.get("path") != "/" + path:
             fail(f"OTA {name} manifest identity mismatch")
-    require_member(
-        entries, "etc/libreecho/ota-public-key.hex",
-        expected_ota_public_key_sha256, 0o644,
+    release_repository = validate_ota_trust(
+        entries, ota, target, expected_ota_public_key_sha256,
+        expected_release_repository, expected_legacy_ota_public_key_sha256,
     )
-    if ota.get("public_key_sha256") != expected_ota_public_key_sha256:
-        fail("OTA public-key manifest identity mismatch")
     network = manifest.get("network", {"enabled": False})
     if not isinstance(network, dict) or not isinstance(network.get("enabled"), bool):
         fail("network manifest record is malformed")
@@ -2065,6 +2092,13 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 f"libreecho-radar-puffin-{expected_update_channel}.ota.tar",
                 source_text,
             )
+            if release_repository == "srsatt":
+                source_text += "release_base=https://github.com/srsatt/LibreEcho/releases\n"
+                source_text = re.sub(
+                    r"^url=.*$",
+                    f"url=https://github.com/srsatt/LibreEcho/releases/latest/download/libreecho-{'biscuit' if target == 'biscuit' else 'radar-puffin'}-{expected_update_channel}.ota.tar",
+                    source_text, count=1, flags=re.MULTILINE,
+                )
             expected = source_text.encode()
         target_name = OVERLAY_TARGETS.get(name, name)
         entry = require_member(entries, target_name, sha256(expected), mode)
@@ -2511,6 +2545,9 @@ def main() -> None:
     parser.add_argument("--expected-bootctl-sha256", required=True)
     parser.add_argument("--expected-update-verifier-sha256", required=True)
     parser.add_argument("--expected-ota-public-key-sha256", required=True)
+    parser.add_argument("--expected-release-repository", choices=("upstream", "srsatt"),
+                        default="upstream")
+    parser.add_argument("--expected-legacy-ota-public-key-sha256")
     parser.add_argument("--expected-adbd-sha256", required=True)
     parser.add_argument("--expected-dropbear-sha256",
                         help="require this static ARM32 Dropbear server in the initramfs")
@@ -2672,7 +2709,8 @@ def main() -> None:
         args.expected_service_profile, args.expected_feature_policy,
         args.expected_update_channel, args.expected_busybox_sha256, args.expected_musl_loader_sha256,
         args.expected_bootctl_sha256, args.expected_update_verifier_sha256,
-        args.expected_ota_public_key_sha256, args.expected_adbd_sha256,
+        args.expected_ota_public_key_sha256, args.expected_release_repository,
+        args.expected_legacy_ota_public_key_sha256, args.expected_adbd_sha256,
         args.expected_audio_probe_sha256,
         args.expected_tinyplay_sha256, args.expected_tinycap_sha256,
         args.expected_tinymix_sha256,

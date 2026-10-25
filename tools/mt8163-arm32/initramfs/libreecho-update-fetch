@@ -247,6 +247,13 @@ config_value()
 validate_source()
 {
     [ "$(config_value schema)" = 1 ] || die source_schema
+    case "$(config_value release_base)" in
+        '') ;;
+        https://github.com/srsatt/LibreEcho/releases)
+            RELEASE_GITHUB=https://github.com/srsatt/LibreEcho/releases
+            RELEASE_MIRROR= ;;
+        *) die source_repository ;;
+    esac
     expected_channel=$(channel_value)
     [ "$expected_channel" = dev ] || [ "$expected_channel" = stable ] || die source_channel
     channel=$expected_channel
@@ -259,9 +266,11 @@ select_release_source()
     # in it. Any failure, including an unexpected body, selects GitHub.
     RELEASE_BASE=$RELEASE_GITHUB
     probe=$ROOT/.control-range-probe.$$
-    bounded_curl "$probe" "$CURL_HEADERS" 64 20 "$RELEASE_MIRROR/healthz" || STREAM_CURL_RC=1
-    if [ "$STREAM_CURL_RC" -eq 0 ] && [ "$($BB head -n 1 "$probe" 2>/dev/null)" = "libreecho-dl ok" ]; then
-        RELEASE_BASE=$RELEASE_MIRROR
+    if [ -n "$RELEASE_MIRROR" ]; then
+        bounded_curl "$probe" "$CURL_HEADERS" 64 20 "$RELEASE_MIRROR/healthz" || STREAM_CURL_RC=1
+        if [ "$STREAM_CURL_RC" -eq 0 ] && [ "$($BB head -n 1 "$probe" 2>/dev/null)" = "libreecho-dl ok" ]; then
+            RELEASE_BASE=$RELEASE_MIRROR
+        fi
     fi
     $BB rm -f "$probe" "$CURL_HEADERS" "$CURL_STDERR"
     url="$RELEASE_BASE/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"
@@ -1167,7 +1176,7 @@ automatic_replay_status()
         case "$id" in ''|.|..|*[!A-Za-z0-9._+~:-]*) return 1;; esac
         [ "${#id}" -le 96 ] || return 1
         directory=${GENERATIONS:-/data/libreecho/generations}/$id
-        "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$directory/target.manifest" "$directory/target.manifest.sig" >/dev/null 2>&1 || continue
+        "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check-installed "$directory/target.manifest" "$directory/target.manifest.sig" >/dev/null 2>&1 || continue
         old_release=$(check_value_from_file "$directory/target.manifest" release)
         if [ "$candidate_release" = "$old_release" ]; then
             if [ "$pointer" = current ]; then printf '%s\n' up-to-date

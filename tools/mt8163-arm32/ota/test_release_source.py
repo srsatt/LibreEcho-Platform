@@ -53,7 +53,7 @@ exit 22
 
 
 class ReleaseSourceSelectionTests(unittest.TestCase):
-    def run_selection(self, health, channel='dev'):
+    def run_selection(self, health, channel='dev', release_base=''):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             curl = root / 'fake-curl'
@@ -63,6 +63,8 @@ class ReleaseSourceSelectionTests(unittest.TestCase):
             (update / 'incoming').mkdir(parents=True)
             (root / 'run/libreecho').mkdir(parents=True)
             (root / 'target').write_text('target_id=radar_puffin\n')
+            (root / 'source.conf').write_text(f'schema=1\nrelease_base={release_base}\n')
+            (root / 'channel').write_text('channel=' + channel + '\n')
             source = FETCHER.read_text()
             source = source[:source.rfind('case "${1:-}" in')]
             source = source.replace('ROOT=/data/libreecho/update', 'ROOT=' + str(update))
@@ -73,10 +75,11 @@ class ReleaseSourceSelectionTests(unittest.TestCase):
             source = source.replace('BB=/bin/busybox', 'BB=' + BUSYBOX, 1)
             source += (
                 f'\nCURL={curl}\nCA=/dev/null\nRUN_ROOT={root / "run"}\n'
-                f'TARGET_FILE={root / "target"}\nchannel={channel}\n'
+                f'TARGET_FILE={root / "target"}\nCONFIG={root / "source.conf"}\n'
+                f'CHANNEL_FILE={root / "channel"}\n'
                 'check_status_write() { :; }\n'
                 'die() { echo "ERROR:$1" >&2; exit 1; }\n'
-                'fetch_lock\nload_fetch_target\nselect_release_source\n'
+                'fetch_lock\nvalidate_source\nselect_release_source\n'
                 'printf "base=%s\\nlatest=%s\\n" "$RELEASE_BASE" "$url"\n'
                 'resolve_dev_release || exit 1\nprintf "dev=%s\\n" "$url"\n'
             )
@@ -127,6 +130,18 @@ class ReleaseSourceSelectionTests(unittest.TestCase):
                          'libreecho-radar-puffin-stable.ota.tar')
         self.assertEqual(requested, ['https://dl.libreecho.org/healthz'])
 
+    def test_fork_transport_uses_only_explicit_repository(self):
+        github = 'https://github.com/srsatt/LibreEcho/releases'
+        result, out, requested, leftovers = self.run_selection('down', release_base=github)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(out['base'], github)
+        self.assertEqual(requested, [github + '/download/radar-puffin-dev-channel/release-pointer-v3.txt'])
+        self.assertEqual(leftovers, [])
+        result, _, requested, _ = self.run_selection('ok', release_base='https://evil.invalid')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('source_repository', result.stderr)
+        self.assertEqual(requested, [])
+
     def test_generation_only_accepts_project_transports(self):
         for given, expected in (
             ('https://dl.libreecho.org', 'https://dl.libreecho.org'),
@@ -144,6 +159,23 @@ class ReleaseSourceSelectionTests(unittest.TestCase):
                     capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, expected)
+
+    def test_generation_fork_configuration_rejects_other_transport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'ota-source.conf'
+            config.write_text('schema=1\nrelease_base=https://github.com/srsatt/LibreEcho/releases\n')
+            head = GENERATION.read_text().split('\nfail() {', 1)[0]
+            head = head.replace('BB=/bin/busybox', 'BB=' + BUSYBOX, 1)
+            for given, valid in (('', True), ('https://github.com/srsatt/LibreEcho/releases', True),
+                                 ('https://dl.libreecho.org', False),
+                                 ('https://github.com/aslater3/LibreEcho/releases', False)):
+                with self.subTest(given=given):
+                    result = subprocess.run([BUSYBOX, 'sh', '-c', head + '\nprintf "%s" "$release_base"'],
+                                            env=os.environ | dict(OTA_SOURCE_CONFIG=str(config), RELEASE_BASE=given),
+                                            capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode == 0, valid, result.stderr)
+                    if valid:
+                        self.assertEqual(result.stdout, 'https://github.com/srsatt/LibreEcho/releases')
 
 
 if __name__ == '__main__':

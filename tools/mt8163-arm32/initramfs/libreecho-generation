@@ -7,13 +7,22 @@ TARGET_MANIFEST=${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}
 CURL=${CURL:-/usr/bin/curl}
 CA=${CA:-/etc/ssl/certs/ca-certificates.crt}
 SPACE_RESERVE_BYTES=${SPACE_RESERVE_BYTES:-262144}
-# Feature asset transport chosen by libreecho-update-fetch. Only the two
-# project transports are accepted (the mirror, the GitHub repository releases
-# are published from, and its planned organisation home); anything else falls
-# back to GitHub. Every
-# asset is still size- and hash-checked against the signed manifest.
+# Feature transport is constrained by the image's reviewed release source.
+configured_base=$($BB sed -n 's/^release_base=//p' "${OTA_SOURCE_CONFIG:-/etc/libreecho/ota-source.conf}" 2>/dev/null)
+case "$configured_base" in
+    ''|https://github.com/srsatt/LibreEcho/releases) ;;
+    *) printf 'ERROR:release-source\n' >&2; exit 1 ;;
+esac
+if [ "$configured_base" = https://github.com/srsatt/LibreEcho/releases ]; then
+    [ -z "${RELEASE_BASE:-}" ] || [ "$RELEASE_BASE" = "$configured_base" ] ||
+        { printf 'ERROR:release-source\n' >&2; exit 1; }
+    RELEASE_BASE=$configured_base
+fi
 case "${RELEASE_BASE:-}" in
     https://dl.libreecho.org|https://github.com/aslater3/LibreEcho/releases|https://github.com/LibreEcho/LibreEcho/releases)
+        release_base=$RELEASE_BASE ;;
+    https://github.com/srsatt/LibreEcho/releases)
+        [ "$configured_base" = "$RELEASE_BASE" ] || { printf 'ERROR:release-source\n' >&2; exit 1; }
         release_base=$RELEASE_BASE ;;
     *) release_base=https://github.com/aslater3/LibreEcho/releases ;;
 esac
@@ -167,7 +176,7 @@ verify_tree() {
     local directory=$1 manifest=$1/target.manifest feature kind file size digest actual expected
     safe_path "$directory"
     regular "$directory/COMPLETE" complete
-    "$TARGET_MANIFEST" check "$manifest" "$directory/target.manifest.sig" || fail target-invalid
+    "$TARGET_MANIFEST" check-installed "$manifest" "$directory/target.manifest.sig" || fail target-invalid
     [ "$($BB cat "$directory/COMPLETE")" = "$(hash_state "$manifest")" ] || fail complete-hash
     [ "$(value transaction_id "$manifest")" = "${2:-${directory##*/}}" ] || fail generation-identity
     expected='COMPLETE

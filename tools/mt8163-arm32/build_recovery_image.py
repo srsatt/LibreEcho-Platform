@@ -915,7 +915,9 @@ def add_target_identity(stage: Path, manifest: dict[str, object],
 def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
                   image_profile: str, service_profile: str, feature_policy: str,
                   update_channel: str, manifest: dict[str, object],
-                  target: str = "radar_puffin", descriptor_sha256: str | None = None) -> None:
+                  target: str = "radar_puffin", descriptor_sha256: str | None = None,
+                  legacy_public_key: Path | None = None,
+                  release_repository: str = "upstream") -> None:
     add_target_identity(stage, manifest, target, descriptor_sha256)
     sources = (
         ("bootctl", bootctl, "usr/local/sbin/libreecho-bootctl",
@@ -944,10 +946,25 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     key_data = read(public_key)
     if not re.fullmatch(rb"[0-9a-f]{64}\n", key_data):
         raise SystemExit("ERROR: OTA Ed25519 public key must be 32-byte lowercase hex")
+    if (release_repository == "srsatt" and sha256(key_data) ==
+            "524c2b6343438b6ccffca8a8c7f0b9f36e6ec9a2ee37424364b6bfeef96d7f40"):
+        raise SystemExit("ERROR: fork primary OTA authority cannot be the stock key")
     key_target = stage / "etc/libreecho/ota-public-key.hex"
     key_target.parent.mkdir(parents=True, exist_ok=True)
     key_target.write_bytes(key_data)
     key_target.chmod(0o644)
+    if legacy_public_key is not None:
+        if target != "biscuit":
+            raise SystemExit("ERROR: the pinned 0.14.4 legacy generation is Biscuit-only")
+        if legacy_public_key.is_symlink() or not legacy_public_key.is_file():
+            raise SystemExit("ERROR: legacy OTA public key must be a regular file")
+        legacy_data = read(legacy_public_key)
+        if (sha256(legacy_data) != "524c2b6343438b6ccffca8a8c7f0b9f36e6ec9a2ee37424364b6bfeef96d7f40"
+                or legacy_data == key_data):
+            raise SystemExit("ERROR: legacy OTA key must be the exact stock 0.14.4 public key")
+        legacy_target = stage / "etc/libreecho/legacy-ota-public-key.hex"
+        legacy_target.write_bytes(legacy_data)
+        legacy_target.chmod(0o644)
 
     profile_target = stage / "etc/libreecho/image-profile"
     profile_target.write_text(image_profile + "\n")
@@ -967,24 +984,32 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     )
     first_install_target.chmod(0o644)
     ota_source = stage / "etc/libreecho/ota-source.conf"
-    if ota_source.is_file() and not ota_source.is_symlink():
-        source_text = ota_source.read_text()
-        source_text = re.sub(
-            r"^channel=.*$", f"channel={update_channel}", source_text,
-            count=1, flags=re.MULTILINE,
-        )
-        source_text = re.sub(
-            r"libreecho-radar-puffin-(?:dev|stable)\.ota\.tar",
-            f"libreecho-radar-puffin-{update_channel}.ota.tar", source_text,
-        )
-        ota_source.write_text(source_text)
-        overlay_manifest = manifest.get("overlay")
-        if not isinstance(overlay_manifest, dict):
-            raise SystemExit("ERROR: OTA source rewrite requires overlay manifest")
-        source_data = source_text.encode()
-        overlay_manifest["ota-source.conf"] = {
-            "sha256": sha256(source_data), "size": len(source_data), "mode": "0644",
-        }
+    if release_repository not in ("upstream", "srsatt"):
+        raise SystemExit("ERROR: release repository must be upstream or srsatt")
+    if not ota_source.is_file() or ota_source.is_symlink():
+        raise SystemExit("ERROR: OTA source configuration is missing or unsafe")
+    source_text = ota_source.read_text()
+    source_text = re.sub(
+        r"^channel=.*$", f"channel={update_channel}", source_text,
+        count=1, flags=re.MULTILINE,
+    )
+    source_text = re.sub(
+        r"libreecho-radar-puffin-(?:dev|stable)\.ota\.tar",
+        f"libreecho-radar-puffin-{update_channel}.ota.tar", source_text,
+    )
+    if release_repository == "srsatt":
+        source_text += "release_base=https://github.com/srsatt/LibreEcho/releases\n"
+        source_text = re.sub(r"^url=.*$",
+                             f"url=https://github.com/srsatt/LibreEcho/releases/latest/download/libreecho-{'biscuit' if target == 'biscuit' else 'radar-puffin'}-{update_channel}.ota.tar",
+                             source_text, count=1, flags=re.MULTILINE)
+    ota_source.write_text(source_text)
+    overlay_manifest = manifest.get("overlay")
+    if not isinstance(overlay_manifest, dict):
+        raise SystemExit("ERROR: OTA source rewrite requires overlay manifest")
+    source_data = source_text.encode()
+    overlay_manifest["ota-source.conf"] = {
+        "sha256": sha256(source_data), "size": len(source_data), "mode": "0644",
+    }
     manifest["image_profile"] = image_profile
     manifest["service_profile"] = service_profile
     manifest["feature_policy"] = feature_policy
@@ -1000,6 +1025,11 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
         "public_key_sha256": sha256(key_data),
         "tools": records,
     }
+    if legacy_public_key is not None:
+        manifest["ota"]["legacy_public_key_sha256"] = sha256(legacy_data)
+        manifest["ota"]["legacy_manifest_sha256"] = "92f3f68a26b9ed1920658e419e1a417aafa9d36d1c0ea8cd90ec8202a832ad0e"
+    if release_repository == "srsatt":
+        manifest["ota"]["release_repository"] = "srsatt"
 
 
 def add_audio_probe(stage: Path, audio_probe: Path,
@@ -2713,6 +2743,10 @@ def main() -> None:
     parser.add_argument("--bootctl", type=Path, required=True)
     parser.add_argument("--update-verifier", type=Path, required=True)
     parser.add_argument("--ota-public-key", type=Path, required=True)
+    parser.add_argument("--legacy-ota-public-key", type=Path,
+                        help="exact stock Biscuit 0.14.4 public key for pinned generation rollback")
+    parser.add_argument("--release-repository", choices=("upstream", "srsatt"),
+                        default="upstream")
     parser.add_argument("--audio-probe", type=Path,
                         help="static ARM32 ALSA capability probe to add to the initramfs")
     parser.add_argument("--tinyplay", type=Path,
@@ -2815,6 +2849,10 @@ def main() -> None:
     add_target_arguments(parser)
     args = parser.parse_args()
     validate_target_arguments(parser, args)
+    if (args.legacy_ota_public_key is not None and
+            (args.legacy_ota_public_key.is_symlink() or
+             not args.legacy_ota_public_key.is_file())):
+        raise SystemExit("ERROR: legacy OTA public key must be a regular file")
 
     connectivity_options = {
         "wmt_config_helper": args.wmt_config_helper,
@@ -3184,6 +3222,8 @@ def main() -> None:
             args.ota_public_key.resolve(), args.image_profile,
             args.service_profile, args.feature_policy, args.update_channel, manifest,
             args.target, args.target_descriptor_sha256,
+            args.legacy_ota_public_key,
+            args.release_repository,
         )
         if args.audio_probe is not None:
             add_audio_probe(stage, args.audio_probe.resolve(), manifest)

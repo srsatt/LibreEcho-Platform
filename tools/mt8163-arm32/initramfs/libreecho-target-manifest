@@ -3,6 +3,10 @@
 BB=/bin/busybox
 VERIFY=${VERIFY:-/usr/local/libexec/libreecho-update-verify}
 PUBLIC_KEY=${PUBLIC_KEY:-/etc/libreecho/ota-public-key.hex}
+LEGACY_PUBLIC_KEY=${LEGACY_PUBLIC_KEY:-/etc/libreecho/legacy-ota-public-key.hex}
+# Only this published Biscuit 0.14.4 generation can use the former authority.
+LEGACY_MANIFEST_SHA256=92f3f68a26b9ed1920658e419e1a417aafa9d36d1c0ea8cd90ec8202a832ad0e
+LEGACY_PUBLIC_KEY_SHA256=524c2b6343438b6ccffca8a8c7f0b9f36e6ec9a2ee37424364b6bfeef96d7f40
 load_image_target()
 {
     local target_file=${TARGET_FILE:-/etc/libreecho/target} target_count
@@ -106,10 +110,16 @@ hash_state() {
 
 
 check_manifest() {
-    local manifest=$1 signature=$2 key field_value seen expected feature suffix path hash
+    local manifest=$1 signature=$2 scope=$3 key field_value seen expected feature suffix path hash
     regular "$manifest" manifest; regular "$signature" signature
     [ "$($BB stat -c %s "$manifest")" -le 32768 ] || fail manifest-size
-    "$VERIFY" "$PUBLIC_KEY" "$manifest" "$signature" >/dev/null 2>&1 || fail manifest-signature
+    if ! "$VERIFY" "$PUBLIC_KEY" "$manifest" "$signature" >/dev/null 2>&1; then
+        [ "$scope" = installed ] &&
+            [ "$(hash_state "$manifest")" = "$LEGACY_MANIFEST_SHA256" ] || fail manifest-signature
+        regular "$LEGACY_PUBLIC_KEY" legacy-key
+        [ "$(hash_state "$LEGACY_PUBLIC_KEY")" = "$LEGACY_PUBLIC_KEY_SHA256" ] || fail legacy-key-hash
+        "$VERIFY" "$LEGACY_PUBLIC_KEY" "$manifest" "$signature" >/dev/null 2>&1 || fail manifest-signature
+    fi
     case "$(value format "$manifest")" in libreecho-ota-v1|libreecho-ota-v2) fail legacy_manifest_unsupported;; esac
     expected='format manifest_version board soc architecture image_profile transaction_type transaction_id release version update_channel service_profile minimum_updater_schema commit_policy boot_filename boot_size boot_sha256 feature_ids'
     for feature in airplay2 tts wakeword stt assistant; do
@@ -170,6 +180,7 @@ check_manifest() {
     done
 }
 case "${1:-}" in
-    check) [ "$#" = 3 ] || fail usage; check_manifest "$2" "$3";;
+    check) [ "$#" = 3 ] || fail usage; check_manifest "$2" "$3" new;;
+    check-installed) [ "$#" = 3 ] || fail usage; check_manifest "$2" "$3" installed;;
     *) fail usage;;
 esac

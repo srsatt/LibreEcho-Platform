@@ -471,7 +471,7 @@ https_client() {
     MANIFEST=$directory/target.manifest
     regular "$MANIFEST" https-target
     regular "$directory/target.manifest.sig" https-signature
-    "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$MANIFEST" "$directory/target.manifest.sig" || fail https-target-invalid
+    "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check-installed "$MANIFEST" "$directory/target.manifest.sig" || fail https-target-invalid
     [ "$(value transaction_id "$MANIFEST")" = "$TX" ] || fail https-target-identity
     # Repair transport authenticates only its own signed bytes; unrelated feature
     # corruption is precisely what an update must be able to repair.
@@ -499,7 +499,7 @@ provenance() {
     directory=$GENERATIONS/$TX
     initial=$(hash_state "$ROOT/current")
     MANIFEST=$directory/target.manifest
-    "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$MANIFEST" "$directory/target.manifest.sig" || fail provenance-target-invalid
+    "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check-installed "$MANIFEST" "$directory/target.manifest.sig" || fail provenance-target-invalid
     digest=$(hash_state "$MANIFEST")
     regular "$directory/COMPLETE" provenance-complete
     [ "$($BB cat "$directory/COMPLETE")" = "$digest" ] || fail provenance-complete-mismatch

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,48 @@ import verify_recovery_image as verifier
 INSTALLER = TOOLS / 'recovery-install/src/META-INF/com/google/android/update-binary'
 
 
+class ForkImageTrustTests(unittest.TestCase):
+    def test_image_verifier_requires_exact_legacy_key_target_and_fork_source(self):
+        legacy_hash = '524c2b6343438b6ccffca8a8c7f0b9f36e6ec9a2ee37424364b6bfeef96d7f40'
+        legacy_manifest = '92f3f68a26b9ed1920658e419e1a417aafa9d36d1c0ea8cd90ec8202a832ad0e'
+        legacy_data = b'cd' * 32 + b'\n'
+        primary_data = b'ef' * 32 + b'\n'
+        primary_hash = verifier.sha256(primary_data)
+        def fixture_hash(data):
+            return legacy_hash if data == legacy_data else hashlib.sha256(data).hexdigest()
+        def entry(name, data):
+            return verifier.Entry(name, stat.S_IFREG | 0o644, 0, 0, 0, data)
+        entries = {
+            'etc/libreecho/ota-public-key.hex': entry('primary', primary_data),
+            'etc/libreecho/legacy-ota-public-key.hex': entry('legacy', legacy_data),
+        }
+        ota = {'public_key_sha256': primary_hash, 'release_repository': 'srsatt',
+               'legacy_public_key_sha256': legacy_hash,
+               'legacy_manifest_sha256': legacy_manifest}
+        with mock.patch.object(verifier, 'sha256', side_effect=fixture_hash):
+            self.assertEqual(verifier.validate_ota_trust(
+                {'etc/libreecho/ota-public-key.hex': entries['etc/libreecho/ota-public-key.hex']},
+                {'public_key_sha256': primary_hash}, 'radar_puffin', primary_hash,
+                'upstream', None), 'upstream')
+            self.assertEqual(verifier.validate_ota_trust(
+                entries, ota, 'biscuit', primary_hash, 'srsatt', legacy_hash), 'srsatt')
+            for changed_entries, changed_ota, target, repository, expected_legacy in (
+                (entries, ota, 'radar_puffin', 'srsatt', legacy_hash),
+                (entries, ota, 'biscuit', 'upstream', legacy_hash),
+                (entries, ota | {'legacy_manifest_sha256': '0' * 64}, 'biscuit', 'srsatt', legacy_hash),
+                (entries, ota, 'biscuit', 'srsatt', None),
+                (entries | {'etc/libreecho/legacy-ota-public-key.hex': entry('legacy', b'wrong')}, ota,
+                 'biscuit', 'srsatt', legacy_hash),
+                ({'etc/libreecho/ota-public-key.hex': entry('primary', legacy_data)},
+                 ota | {'public_key_sha256': legacy_hash}, 'biscuit', 'srsatt', legacy_hash),
+            ):
+                with self.subTest(target=target, repository=repository, ota=changed_ota):
+                    expected_primary = changed_ota['public_key_sha256']
+                    with self.assertRaises(SystemExit):
+                        verifier.validate_ota_trust(changed_entries, changed_ota, target,
+                                                    expected_primary, repository, expected_legacy)
+
+
 def function(source, name):
     start = source.index(name + '()')
     end = source.index('\n}', start) + 2
@@ -38,6 +81,33 @@ def run(command, **kwargs):
 
 
 class TargetCLITests(unittest.TestCase):
+    def test_image_builder_cli_rejects_legacy_public_key_symlink_before_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            public = root / 'public.hex'
+            public.write_text('cd' * 32 + '\n')
+            linked = root / 'linked.hex'
+            linked.symlink_to(public)
+            missing = str(root / 'missing-input')
+            command = [sys.executable, str(TOOLS / 'build_recovery_image.py'),
+                       '--boot-envelope', missing, '--adbd', missing,
+                       '--adbd-source-metadata', missing, '--busybox', missing,
+                       '--expected-busybox-sha256', '0' * 64,
+                       '--musl-loader', missing, '--expected-musl-loader-sha256', '0' * 64,
+                       '--image-profile', 'ota', '--update-channel', 'dev',
+                       '--bootctl', missing, '--update-verifier', missing,
+                       '--ota-public-key', missing, '--zimage', missing,
+                       '--system-map', missing, '--output', str(root / 'out.img'),
+                       '--target', 'biscuit', '--release-repository', 'srsatt',
+                       '--legacy-ota-public-key']
+            rejected = run([*command, str(linked)])
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('legacy OTA public key must be a regular file', rejected.stderr)
+            direct = run([*command, str(public)])
+            self.assertNotEqual(direct.returncode, 0)
+            self.assertNotIn('legacy OTA public key must be a regular file', direct.stderr)
+            self.assertFalse((root / 'out.img').exists())
+
     def test_all_product_tools_advertise_target_and_descriptor(self):
         # Every tool Product probes before building (build.sh frontier).
         for tool in ('generate_boot_envelope.py', 'build_recovery_image.py', 'verify_recovery_image.py',
@@ -545,7 +615,7 @@ class RadarTreeDiffTests(unittest.TestCase):
                 result[name] = {'kind': 'directory', 'mode': stat.S_IMODE(path.stat().st_mode)}
         return result
 
-    def stage(self, module, tools, root, bootctl, *, target=None):
+    def stage(self, module, tools, root, bootctl, *, target=None, **ota_kwargs):
         stage = root / 'stage'; stage.mkdir(parents=True)
         emulator = root / 'host-busybox-app-list'
         emulator.write_text('#!/bin/sh\n/bin/busybox --list | while read -r name; do [ \"$name\" = busybox ] || printf \"%s\\n\" \"$name\"; done\n'); emulator.chmod(0o755)
@@ -558,8 +628,43 @@ class RadarTreeDiffTests(unittest.TestCase):
                            module.sha256(loader.read_bytes()), str(emulator), metadata)
         with mock.patch.object(module, 'require_elf_contract', return_value={'host_fixture': True}):
             args = () if target is None else (target,)
-            module.add_ota_tools(stage, bootctl, verify, public, 'ota', 'production', 'exclude', 'dev', metadata, *args)
+            module.add_ota_tools(stage, bootctl, verify, public, 'ota', 'production', 'exclude', 'dev', metadata, *args, **ota_kwargs)
         return stage, metadata
+
+    def test_fork_image_stages_only_pinned_biscuit_legacy_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootctl = root / 'bootctl'
+            bootctl.write_bytes(b'host bootctl fixture')
+            legacy = root / 'legacy-public.hex'
+            legacy.write_text('cd' * 32 + '\n')
+            real_sha256 = image.sha256
+            def fixture_sha256(data):
+                if data == legacy.read_bytes():
+                    return '524c2b6343438b6ccffca8a8c7f0b9f36e6ec9a2ee37424364b6bfeef96d7f40'
+                return real_sha256(data)
+            with mock.patch.object(image, 'sha256', side_effect=fixture_sha256):
+                stage, metadata = self.stage(image, TOOLS, root / 'fork', bootctl,
+                    target='biscuit', legacy_public_key=legacy, release_repository='srsatt')
+                self.assertEqual((stage / 'etc/libreecho/legacy-ota-public-key.hex').read_bytes(), legacy.read_bytes())
+                self.assertIn('release_base=https://github.com/srsatt/LibreEcho/releases\n',
+                              (stage / 'etc/libreecho/ota-source.conf').read_text())
+                self.assertIn('libreecho-biscuit-dev.ota.tar',
+                              (stage / 'etc/libreecho/ota-source.conf').read_text())
+                self.assertEqual(metadata['ota']['release_repository'], 'srsatt')
+                self.assertEqual(metadata['ota']['legacy_public_key_sha256'], fixture_sha256(legacy.read_bytes()))
+                with self.assertRaisesRegex(SystemExit, 'Biscuit-only'):
+                    self.stage(image, TOOLS, root / 'radar', bootctl,
+                        target='radar_puffin', legacy_public_key=legacy, release_repository='srsatt')
+            with self.assertRaisesRegex(SystemExit, 'exact stock'):
+                self.stage(image, TOOLS, root / 'wrong', bootctl,
+                    target='biscuit', legacy_public_key=legacy, release_repository='srsatt')
+            with mock.patch.object(image, 'sha256', side_effect=lambda data:
+                    '524c2b6343438b6ccffca8a8c7f0b9f36e6ec9a2ee37424364b6bfeef96d7f40'
+                    if data == b'ab' * 32 + b'\n' else real_sha256(data)):
+                with self.assertRaisesRegex(SystemExit, 'fork primary OTA authority'):
+                    self.stage(image, TOOLS, root / 'stock-primary', bootctl,
+                        target='biscuit', release_repository='srsatt')
 
     def test_complete_radar_staged_tree_excludes_only_amended_paths(self):
         import importlib.util
